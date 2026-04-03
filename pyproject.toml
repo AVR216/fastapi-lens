@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastapi-lens"
-version = "0.2.0"
+version = "0.2.1"
 description = "API usage intelligence for FastAPI — track, analyze, and surface dead endpoints."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 keywords = ["fastapi", "api", "observability", "middleware", "analytics"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Framework :: FastAPI",
@@ -36,8 +36,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/fastapi-lens"
-Issues = "https://github.com/yourusername/fastapi-lens/issues"
+"Homepage" = "https://github.com/AVR216/fastapi-lens"
+"Repository" = "https://github.com/AVR216/fastapi-lens.git"
+"Bug Tracker" = "https://github.com/AVR216/fastapi-lens/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["fastapi_lens"]

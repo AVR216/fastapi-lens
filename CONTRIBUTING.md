@@ -6,7 +6,7 @@ We're glad you're interested in contributing! This project aims to be a lightwei
 
 1.  **Clone the repository**:
     ```bash
-    git clone https://github.com/yourusername/fastapi-lens.git
+    git clone https://github.com/AVR216/fastapi-lens.git
     cd fastapi-lens
     ```
 
