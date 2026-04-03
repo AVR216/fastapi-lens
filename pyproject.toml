@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fastapi-lens"
+version = "0.2.0"
+description = "API usage intelligence for FastAPI — track, analyze, and surface dead endpoints."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["fastapi", "api", "observability", "middleware", "analytics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Framework :: FastAPI",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# Zero mandatory dependencies beyond FastAPI itself
+dependencies = [
+    "fastapi>=0.100.0",
+    "starlette>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.24",       # for TestClient
+    "anyio>=4.0",
+    "uvicorn>=0.22.0",   # for running demos
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/fastapi-lens"
+Issues = "https://github.com/yourusername/fastapi-lens/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["fastapi_lens"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
