@@ -131,7 +131,7 @@ Your FastAPI app
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for local setup and testing guidelines.
+Contributions are welcome! Please see [Contributing](https://github.com/AVR216/fastapi-lens/blob/main/CONTRIBUTING.md) for local setup and testing guidelines.
 
 ---
 
