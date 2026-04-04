@@ -55,7 +55,6 @@ class LensMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self.config = config or LensConfig()
 
-        # Reuse storage created in setup() if available, else create a new one
         cfg_id = id(self.config)
         if cfg_id in _storage_cache:
             self.storage = _storage_cache.pop(cfg_id)
@@ -64,6 +63,8 @@ class LensMiddleware(BaseHTTPMiddleware):
 
         self._queue: asyncio.Queue[RequestRecord] = asyncio.Queue(maxsize=10_000)
         self._flush_task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task] = None # <--- Nuevo
+        self._lock = asyncio.Lock() # New: To avoid 2 requests creating 2 loops
         self._started = False
 
     @classmethod
@@ -90,15 +91,58 @@ class LensMiddleware(BaseHTTPMiddleware):
         # Add the middleware — __init__ will pick up storage from cache
         app.add_middleware(cls, config=cfg)
 
-    def _ensure_flush_task(self) -> None:
-        """Start the background flush task lazily on first request."""
-        if not self._started:
-            self._started = True
-            loop = asyncio.get_event_loop()
-            self._flush_task = loop.create_task(self._flush_loop(), name="lens_flush")
+
+    async def _ensure_flush_task(self) -> None:
+        """Start background tasks lazily on first request."""
+        if self._started:
+            return
+
+        async with self._lock: 
+            if not self._started:
+                loop = asyncio.get_running_loop()
+                self._flush_task = loop.create_task(self._flush_loop(), name="lens_flush")
+                
+                if self.config.ttl_days:
+                    self._cleanup_task = loop.create_task(self._cleanup_loop(), name="lens_cleanup")
+                
+                self._started = True
+
+    async def _cleanup_loop(self) -> None:
+        """
+        Background task: Runs once every 24 hours to delete records older than TTL.
+        Uses run_in_executor to avoid blocking the event loop during VACUUM.
+        """
+        # We wait 60 seconds before the first cleanup to not stress the app startup.
+        await asyncio.sleep(60)
+
+        if not self.config.ttl_days:
+            return
+
+        while True:
+            try:
+                loop = asyncio.get_event_loop()
+                # We execute the cleanup (which includes DELETE + VACUUM)
+                deleted = await loop.run_in_executor(
+                    None, 
+                    self.storage.cleanup_old_data, 
+                    self.config.ttl_days
+                )
+                
+                if deleted > 0:
+                    logger.info("lens ttl cleanup: removed %d expired records", deleted)
+                
+                # Wait 24 hours for the next round
+                await asyncio.sleep(86400) 
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("lens cleanup error: %s. Retrying in 1 hour.", exc)
+                # If it fails (e.g. DB blocked), we retry in 1 hour instead of 24
+                await asyncio.sleep(3600)
 
     async def force_flush(self) -> None:
-        """Vacía la cola de peticiones a la DB inmediatamente."""
+        """Flushes the queue of requests to the DB immediately."""
         batch: List[RequestRecord] = []
         while not self._queue.empty():
             try:
@@ -107,7 +151,7 @@ class LensMiddleware(BaseHTTPMiddleware):
                 break
         
         if batch:
-            # Usamos run_in_executor para no bloquear si la DB está ocupada
+            # We use run_in_executor to avoid blocking if the DB is busy
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self.storage.insert_batch, batch)
 
@@ -176,14 +220,12 @@ class LensMiddleware(BaseHTTPMiddleware):
         return None
 
     async def dispatch(self, request: Request, call_next) -> Response:
-        self._ensure_flush_task()
+        await self._ensure_flush_task()
 
-        # Attach instance to app state for easier testing/access
         if not hasattr(request.app.state, "lens_middleware"):
             try:
                 request.app.state.lens_middleware = self
-            except Exception:  # pragma: no cover
-                pass
+            except Exception: pass
 
         path = self._resolve_path_template(request)
         method = request.method
@@ -209,20 +251,29 @@ class LensMiddleware(BaseHTTPMiddleware):
             client_ip=request.client.host if request.client else None,
         )
 
-        # Non-blocking: drop record if queue is full rather than slow the request
         try:
             self._queue.put_nowait(record)
         except asyncio.QueueFull:
-            logger.debug("lens queue full — dropping record for %s %s", method, path)
+            logger.debug("lens queue full — dropping record")
 
         return response
 
     async def close(self) -> None:
-        """Call on app shutdown to flush pending records."""
+        """Call on app shutdown to flush pending records and stop cleanup."""
+        # Cancel flush
         if self._flush_task and not self._flush_task.done():
             self._flush_task.cancel()
             try:
                 await self._flush_task
             except asyncio.CancelledError:
                 pass
+        
+        # Cancel cleanup
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+                
         self.storage.close()

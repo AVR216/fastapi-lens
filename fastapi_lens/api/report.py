@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.security.api_key import APIKeyHeader
 from starlette.status import HTTP_403_FORBIDDEN
 
@@ -25,31 +25,26 @@ def make_report_router(storage: SQLiteStorage, config: LensConfig) -> APIRouter:
     """
     router = APIRouter(tags=["lens"])
 
-    # --- Auth dependency (optional) ---
     _api_key_header = APIKeyHeader(name="X-Lens-Key", auto_error=False)
 
     def verify_key(
+        days: Optional[str] = Query(None), 
         header_key: Optional[str] = Depends(_api_key_header),
         query_key: Optional[str] = Query(None, alias="report_key"),
     ) -> None:
         if not config.security_enabled:
-            return  # No security configured
-            
+            return
+
+        if days is None or days == "":
+            return
+
         if config.report_key is None:
-            # If security is enabled but no key is set, we block all access to be safe
-            raise HTTPException(
-                status_code=HTTP_403_FORBIDDEN,
-                detail="Security is enabled but no report_key is configured on the server",
-            )
+            raise HTTPException(status_code=403, detail="Security set but no key configured")
         
-        # Check both header and query parameter
         if header_key == config.report_key or query_key == config.report_key:
             return
             
-        raise HTTPException(
-            status_code=HTTP_403_FORBIDDEN,
-            detail="Forbidden: Invalid or missing report key (X-Lens-Key header or report_key query param)",
-        )
+        raise HTTPException(status_code=403, detail="Acceso Denegado")
 
     # --- Helpers ---
     def _since_timestamp(days: Optional[int]) -> float:
@@ -58,6 +53,7 @@ def make_report_router(storage: SQLiteStorage, config: LensConfig) -> APIRouter:
         return time.time() - (days * 86400)
 
     def _serialize_stat(stat: EndpointStats) -> Dict[str, Any]:
+        """Convierte el modelo a un diccionario compatible con el Dashboard."""
         return {
             "path": stat.path,
             "method": stat.method,
@@ -81,61 +77,85 @@ def make_report_router(storage: SQLiteStorage, config: LensConfig) -> APIRouter:
 
     @router.get(config.report_path)
     def report(
-        days: Optional[int] = Query(None, description="Filter to last N days. Omit for all-time."),
-        status: Optional[str] = Query(None, description="Filter by status: active, cold, dead, never_called"),
+        request: Request, # Añadimos el request para acceder a las rutas de la app
+        days: Optional[int] = Query(None),
+        status: Optional[str] = Query(None),
         _: None = Depends(verify_key),
     ) -> Dict[str, Any]:
-        """
-        Returns aggregated metrics for all recorded endpoints.
-
-        - **active**: called within the last 7 days
-        - **cold**: last call was 7–30 days ago
-        - **dead**: no calls in 30+ days
-        - **never_called**: endpoint exists in spec but no calls recorded
-        """
         since = _since_timestamp(days)
-        stats: List[EndpointStats] = storage.get_stats(since=since)
+        # 1. Obtener lo que SI está en la DB
+        db_stats: List[EndpointStats] = storage.get_stats(since=since)
+        recorded_keys = {(s.path, s.method) for s in db_stats}
 
-        # Enrich percentiles
-        for stat in stats:
-            p = storage.get_percentiles(stat.path, stat.method, since)
-            stat.p50_duration_ms = p["p50"]
-            stat.p95_duration_ms = p["p95"]
-            stat.p99_duration_ms = p["p99"]
+        # 2. DISCOVERY: Buscar rutas en la App que NO están en la DB
+        all_stats = list(db_stats)
+        
+        # Iteramos sobre las rutas registradas en FastAPI
+        for route in request.app.routes:
+            # Solo nos interesan rutas de tipo APIRoute (ignora mounts/static)
+            if hasattr(route, "path") and hasattr(route, "methods"):
+                path = route.path
+                # Saltamos las rutas excluidas y las propias de Lens
+                if not any(path.startswith(ex) for ex in config.exclude_paths):
+                    for method in route.methods:
+                        if (path, method) not in recorded_keys:
+                            # Creamos un objeto "Never Called" virtual
+                            all_stats.append(EndpointStats(
+                                path=path,
+                                method=method,
+                                total_calls=0,
+                                error_4xx_count=0,
+                                error_5xx_count=0,
+                                avg_duration_ms=0,
+                                p50_duration_ms=0,
+                                p95_duration_ms=0,
+                                p99_duration_ms=0,
+                                max_duration_ms=0,
+                                last_called_at=None,
+                                first_called_at=None,
+                            ))
 
-        # Optional filter by status
+        # 3. Enriquecer percentiles solo para los que tienen llamadas
+        for stat in all_stats:
+            if stat.total_calls > 0:
+                p = storage.get_percentiles(stat.path, stat.method, since)
+                stat.p50_duration_ms = p["p50"]
+                stat.p95_duration_ms = p["p95"]
+                stat.p99_duration_ms = p["p99"]
+
+        # 4. Filtro opcional por status (ahora incluye 'never_called')
         if status:
-            stats = [s for s in stats if s.status == status]
-
-        total_requests = storage.total_requests(since=since)
-        active = sum(1 for s in stats if s.status == "active")
-        cold = sum(1 for s in stats if s.status == "cold")
-        dead = sum(1 for s in stats if s.status == "dead")
-        never_called = sum(1 for s in stats if s.status == "never_called")
+            all_stats = [s for s in all_stats if s.status == status]
 
         return {
             "generated_at": time.time(),
             "filters": {"days": days, "status": status},
             "summary": {
-                "total_endpoints": len(stats),
-                "total_requests": total_requests,
-                "active": active,
-                "cold": cold,
-                "dead": dead,
-                "never_called": never_called,
+                "total_endpoints": len(all_stats),
+                "total_requests": storage.total_requests(since=since),
+                "active": sum(1 for s in all_stats if s.status == "active"),
+                "cold": sum(1 for s in all_stats if s.status == "cold"),
+                "dead": sum(1 for s in all_stats if s.status == "dead"),
+                "never_called": sum(1 for s in all_stats if s.status == "never_called"),
             },
-            "endpoints": [_serialize_stat(s) for s in stats],
+            "endpoints": [_serialize_stat(s) for s in all_stats],
         }
 
     @router.get(f"{config.report_path}/top")
     def top_endpoints(
-        limit: int = Query(10, ge=1, le=100, description="Number of top endpoints to return"),
-        days: Optional[int] = Query(7, description="Window in days"),
+        limit: int = Query(10, ge=1, le=100),
+        days: Optional[int] = Query(7),
         _: None = Depends(verify_key),
     ) -> Dict[str, Any]:
-        """Returns the most called endpoints in the given time window."""
         since = _since_timestamp(days)
         stats = storage.get_stats(since=since, limit=limit)
+        # Also enrich percentiles here for consistency
+        for stat in stats:
+            p = storage.get_percentiles(stat.path, stat.method, since)
+            stat.p50_duration_ms = p["p50"]
+            stat.p95_duration_ms = p["p95"]
+            stat.p99_duration_ms = p["p99"]
+            
         return {
             "generated_at": time.time(),
             "window_days": days,
@@ -144,10 +164,9 @@ def make_report_router(storage: SQLiteStorage, config: LensConfig) -> APIRouter:
 
     @router.get(f"{config.report_path}/dead")
     def dead_endpoints(
-        days: Optional[int] = Query(None, description="Filter to last N days"),
+        days: Optional[int] = Query(None),
         _: None = Depends(verify_key),
     ) -> Dict[str, Any]:
-        """Returns only endpoints with no calls in 30+ days."""
         since = _since_timestamp(days)
         stats = storage.get_stats(since=since)
         dead = [s for s in stats if s.status in ("dead", "never_called")]
@@ -159,11 +178,7 @@ def make_report_router(storage: SQLiteStorage, config: LensConfig) -> APIRouter:
 
     @router.get("/lens/dashboard")
     def dashboard(_: None = Depends(verify_key)) -> Response:
-        """Returns a premium HTML dashboard. Insecure by default for easy viewing."""
         from starlette.responses import HTMLResponse
-        
-        # We use a single-file SPA for portability.
-        # Design: Cyberpunk/Glassmorphism using Vanilla CSS + Inter Font.
         html = _DASHBOARD_HTML.replace("{{report_path}}", config.report_path)
         return HTMLResponse(content=html)
 
@@ -182,129 +197,119 @@ _DASHBOARD_HTML = """
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg: #0f172a;
-            --surface: #1e293b;
-            --primary: #38bdf8;
-            --primary-glow: rgba(56, 189, 248, 0.2);
-            --danger: #f43f5e;
-            --warning: #fbbf24;
-            --success: #10b981;
-            --text-main: #f8fafc;
-            --text-dim: #94a3b8;
-            --glass: rgba(255, 255, 255, 0.05);
-            --border: rgba(255, 255, 255, 0.1);
+            --bg: #0f172a; --surface: #1e293b; --primary: #38bdf8; --primary-glow: rgba(56, 189, 248, 0.2);
+            --danger: #f43f5e; --warning: #fbbf24; --success: #10b981; --text-main: #f8fafc;
+            --text-dim: #94a3b8; --glass: rgba(255, 255, 255, 0.05); --border: rgba(255, 255, 255, 0.1);
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { 
-            font-family: 'Outfit', sans-serif; 
-            background: var(--bg); 
-            color: var(--text-main); 
-            line-height: 1.5;
-            overflow-x: hidden;
-        }
-        .app { max-width: 1200px; margin: 0 auto; padding: 2rem; min-height: 100vh; }
+        body { font-family: 'Outfit', sans-serif; background: var(--bg); color: var(--text-main); line-height: 1.5; overflow-x: hidden; }
+        .app { max-width: 1240px; margin: 0 auto; padding: 2rem; min-height: 100vh; }
+        
         header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2.5rem; }
-        h1 { font-size: 2rem; font-weight: 600; display: flex; align-items: center; gap: 0.75rem; }
-        h1 i { color: var(--primary); }
-        .badge { padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+        h1 { font-size: 1.75rem; font-weight: 600; }
+        h1 span { color: var(--primary); }
+        .refresh-indicator { display: flex; align-items: center; gap: 0.6rem; font-size: 0.85rem; color: var(--text-dim); background: var(--glass); padding: 0.5rem 1rem; border-radius: 2rem; border: 1px solid var(--border); }
+        .pulse { width: 10px; height: 10px; background: var(--success); border-radius: 50%; display: inline-block; animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.5); } 70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); } 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); } }
+
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1.25rem; margin-bottom: 2.5rem; }
+        .card { background: var(--surface); border: 1px solid var(--border); border-radius: 1.25rem; padding: 1.5rem; transition: all 0.3s ease; position: relative; overflow: hidden; }
+        .card:hover { transform: translateY(-5px); border-color: var(--primary); box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5); }
+        .card-label { font-size: 0.75rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; }
+        .card-value { font-size: 2rem; font-weight: 600; margin-top: 0.5rem; letter-spacing: -0.02em; }
+
+        .controls { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.5rem; align-items: center; }
+        .search-box { flex-grow: 1; min-width: 280px; position: relative; }
+        .search-box input { 
+            width: 100%; background: var(--surface); border: 1px solid var(--border); color: white; 
+            padding: 0.75rem 1.25rem; border-radius: 1rem; font-family: inherit; outline: none; transition: border-color 0.2s;
+        }
+        .search-box input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-glow); }
+        .select { background: var(--surface); color: white; border: 1px solid var(--border); padding: 0.75rem 1rem; border-radius: 1rem; cursor: pointer; font-family: inherit; outline: none; }
+        .select:hover { border-color: var(--primary); }
+
+        .table-container { background: var(--glass); backdrop-filter: blur(10px); border: 1px solid var(--border); border-radius: 1.25rem; overflow: hidden; }
+        table { width: 100%; border-collapse: collapse; text-align: left; }
+        th { background: rgba(255, 255, 255, 0.03); padding: 1.25rem; font-size: 0.7rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.1em; border-bottom: 1px solid var(--border); }
+        td { padding: 1.25rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: rgba(255, 255, 255, 0.02); }
+
+        .badge { padding: 0.25rem 0.75rem; border-radius: 8px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; display: inline-block; }
         .badge-active { background: rgba(16, 185, 129, 0.1); color: var(--success); border: 1px solid var(--success); }
         .badge-cold { background: rgba(251, 191, 36, 0.1); color: var(--warning); border: 1px solid var(--warning); }
         .badge-dead { background: rgba(244, 63, 94, 0.1); color: var(--danger); border: 1px solid var(--danger); }
+        .badge-never_called { background: rgba(148, 163, 184, 0.1); color: var(--text-dim); border: 1px solid var(--text-dim); }
         
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1.5rem; margin-bottom: 3rem; }
-        .card { 
-            background: var(--surface); 
-            border: 1px solid var(--border); 
-            border-radius: 1.25rem; 
-            padding: 1.5rem; 
-            transition: transform 0.2s, box-shadow 0.2s;
-            position: relative;
-            overflow: hidden;
-        }
-        .card:hover { transform: translateY(-4px); box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3); }
-        .card::after {
-            content: ''; position: absolute; top: -50%; left: -50%; width: 200%; height: 200%;
-            background: radial-gradient(circle at center, var(--primary-glow) 0%, transparent 70%);
-            opacity: 0; transition: opacity 0.3s; pointer-events: none;
-        }
-        .card:hover::after { opacity: 1; }
-        .card-label { font-size: 0.875rem; color: var(--text-dim); margin-bottom: 0.5rem; }
-        .card-value { font-size: 2.25rem; font-weight: 600; letter-spacing: -0.025em; }
+        .method { font-family: 'JetBrains Mono'; font-weight: 600; font-size: 0.75rem; color: var(--primary); background: var(--primary-glow); padding: 3px 8px; border-radius: 6px; margin-right: 10px; }
+        .path { font-family: 'JetBrains Mono'; font-size: 0.9rem; color: var(--text-main); }
+
+        .error-breakdown { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: rgba(255,255,255,0.05); margin-top: 10px; width: 180px; }
+        .err-4xx { background: var(--warning); height: 100%; transition: width 0.5s ease; }
+        .err-5xx { background: var(--danger); height: 100%; transition: width 0.5s ease; }
         
-        .table-container { 
-            background: var(--glass); 
-            backdrop-filter: blur(12px); 
-            border: 1px solid var(--border); 
-            border-radius: 1.25rem; 
-            overflow: hidden; 
-        }
-        table { width: 100%; border-collapse: collapse; text-align: left; }
-        th { 
-            background: rgba(255, 255, 255, 0.02); 
-            padding: 1rem 1.5rem; 
-            font-size: 0.75rem; 
-            text-transform: uppercase; 
-            letter-spacing: 0.1em; 
-            color: var(--text-dim);
-            border-bottom: 1px solid var(--border);
-        }
-        td { padding: 1rem 1.5rem; border-bottom: 1px solid var(--border); font-size: 0.95rem; }
-        tr:last-child td { border-bottom: none; }
-        tr:hover td { background: rgba(255, 255, 255, 0.02); }
-        .path { font-family: 'JetBrains Mono', monospace; font-size: 0.875rem; color: var(--primary); }
-        .method { font-weight: 600; margin-right: 0.5rem; width: 45px; display: inline-block; }
-        .latency { font-family: 'JetBrains Mono', monospace; }
-        
-        .filters { display: flex; gap: 1rem; margin-bottom: 1.5rem; }
-        .select { 
-            background: var(--surface); color: var(--text-main); border: 1px solid var(--border); 
-            padding: 0.5rem 1rem; border-radius: 0.75rem; font-family: inherit; cursor: pointer; outline: none;
-        }
-        .select:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-glow); }
-        
-        .loading { display: flex; justify-content: center; align-items: center; padding: 4rem; opacity: 0.5; }
-        .error-rate-bar { width: 100%; height: 4px; background: rgba(255,255,255,0.05); border-radius: 2px; margin-top: 4px; overflow: hidden; }
-        .error-rate-fill { height: 100%; background: var(--danger); transition: width 1s; }
+        .latency-cell { font-family: 'JetBrains Mono'; font-size: 0.85rem; color: var(--text-dim); white-space: nowrap; }
+        .latency-cell b { color: var(--text-main); }
+        .p99 { color: var(--danger) !important; font-weight: 600; }
     </style>
 </head>
 <body>
     <div class="app">
         <header>
-            <h1><i>🔍</i> fastapi-lens</h1>
-            <div id="last-updated" style="font-size: 0.875rem; color: var(--text-dim);">Actualizando...</div>
+            <h1>fastapi-lens <span>🔍</span></h1>
+            <div class="refresh-indicator">
+                <span class="pulse"></span>
+                <span id="last-updated">Loading...</span>
+            </div>
         </header>
 
-        <div class="stats-grid" id="summary-cards">
+        <div class="stats-grid">
+            <div class="card">
+                <div class="card-label">Total Routes</div>
+                <div id="val-total-routes" class="card-value">-</div>
+            </div>
             <div class="card">
                 <div class="card-label">Total Traffic</div>
-                <div class="card-value" id="val-total">-</div>
+                <div id="val-total" class="card-value">-</div>
             </div>
             <div class="card">
                 <div class="card-label">Success Rate</div>
-                <div class="card-value" id="val-success">-</div>
+                <div id="val-success" class="card-value">-</div>
             </div>
             <div class="card">
                 <div class="card-label">Avg P95 Latency</div>
-                <div class="card-value" id="val-latency">-</div>
+                <div id="val-latency" class="card-value">-</div>
             </div>
             <div class="card">
                 <div class="card-label">Active Routes</div>
-                <div class="card-value" id="val-active">-</div>
+                <div id="val-active" class="card-value">-</div>
             </div>
         </div>
 
-        <div class="filters">
+        <div class="controls">
+            <div class="search-box">
+                <input type="text" id="search-input" placeholder="Search by endpoint or method..." oninput="renderTable()">
+            </div>
+            
+            <select class="select" id="filter-status" onchange="renderTable()">
+                <option value="all">All Statuses</option>
+                <option value="active">Active</option>
+                <option value="cold">Cold</option>
+                <option value="dead">Dead</option>
+                <option value="never_called">Never Called</option>
+            </select>
+
             <select class="select" id="filter-days" onchange="loadData()">
                 <option value="none">All Time</option>
                 <option value="1">Last 24h</option>
                 <option value="7" selected>Last 7 days</option>
                 <option value="30">Last 30 days</option>
             </select>
-            <select class="select" id="filter-status" onchange="renderTable()">
-                <option value="all">All States</option>
-                <option value="active">Active</option>
-                <option value="cold">Cold</option>
-                <option value="dead">Dead</option>
+            
+            <select class="select" id="filter-sort" onchange="renderTable()">
+                <option value="calls">Sort by Traffic</option>
+                <option value="p95">Sort by Latency (P95)</option>
+                <option value="path">Sort A-Z</option>
             </select>
         </div>
 
@@ -312,16 +317,14 @@ _DASHBOARD_HTML = """
             <table>
                 <thead>
                     <tr>
-                        <th>Endpoint</th>
-                        <th>Health</th>
+                        <th>Endpoint & Errors</th>
+                        <th>Status</th>
                         <th>Calls</th>
-                        <th>Latency (P50/P95/P99)</th>
+                        <th>Latency (P50 / P95 / P99)</th>
                         <th>Last Call</th>
                     </tr>
                 </thead>
-                <tbody id="endpoint-table">
-                    <tr><td colspan="5" class="loading">Cargando métricas...</td></tr>
-                </tbody>
+                <tbody id="endpoint-table"></tbody>
             </table>
         </div>
     </div>
@@ -330,80 +333,135 @@ _DASHBOARD_HTML = """
         let currentData = null;
 
         async function loadData() {
-            const days = document.getElementById('filter-days').value;
+            const daysVal = document.getElementById('filter-days').value;
             const urlParams = new URLSearchParams(window.location.search);
             const reportKey = urlParams.get('report_key');
             
-            let url = `{{report_path}}?days=${days === 'none' ? '' : days}`;
-            if (reportKey) {
-                url += `&report_key=${reportKey}`;
-            }
+            const params = new URLSearchParams();
+            if (daysVal !== 'none') params.append('days', daysVal);
+            if (reportKey) params.append('report_key', reportKey);
+
+            const queryString = params.toString();
+            const url = `{{report_path}}${queryString ? '?' + queryString : ''}`;
             
             try {
                 const resp = await fetch(url);
-                if (!resp.ok) {
-                    if (resp.status === 403) {
-                        document.getElementById('endpoint-table').innerHTML = '<tr><td colspan="5" align="center" style="color: var(--danger)">403 Forbidden: Invalid or missing report_key</td></tr>';
-                    }
-                    return;
-                }
+                if (resp.status === 403) throw new Error("AUTH_REQUIRED");
+                if (!resp.ok) throw new Error("SERVER_ERROR");
+
                 currentData = await resp.json();
                 updateSummary();
                 renderTable();
-                document.getElementById('last-updated').innerText = `Updated at ${new Date().toLocaleTimeString()}`;
+                document.getElementById('last-updated').innerText = `Last updated: ${new Date().toLocaleTimeString()}`;
             } catch (err) {
-                console.error("Lens error:", err);
-                document.getElementById('endpoint-table').innerHTML = '<tr><td colspan="5" align="center" style="color: var(--danger)">Error loading data</td></tr>';
+                let title = "System Error";
+                let detail = "Could not fetch metrics.";
+                if (err.message === "AUTH_REQUIRED") {
+                    title = "Access Denied";
+                    detail = "Invalid report_key or missing X-Lens-Key.";
+                }
+                document.getElementById('endpoint-table').innerHTML = `
+                    <tr><td colspan="5" style="text-align:center; padding:4rem;">
+                        <div style="color:var(--danger); font-size:1.2rem; font-weight:600;">${title}</div>
+                        <div style="color:var(--text-dim); margin-top:0.5rem;">${detail}</div>
+                    </td></tr>`;
             }
         }
 
         function updateSummary() {
-            if (!currentData || !currentData.summary) return;
+            if (!currentData) return;
             const s = currentData.summary;
+            document.getElementById('val-total-routes').innerText = s.total_endpoints.toLocaleString();
             document.getElementById('val-total').innerText = s.total_requests.toLocaleString();
-            
-            const endpoints = currentData.endpoints || [];
-            const avgP95 = endpoints.length > 0 ? (endpoints.reduce((acc, e) => acc + e.p95_duration_ms, 0) / endpoints.length).toFixed(1) : 0;
-            const avgSuccess = endpoints.length > 0 ? (endpoints.reduce((acc, e) => acc + (e.success_rate_pct || 0), 0) / endpoints.length).toFixed(1) : 100;
-            
-            document.getElementById('val-latency').innerText = `${avgP95}ms`;
             document.getElementById('val-active').innerText = s.active;
-            document.getElementById('val-success').innerText = `${avgSuccess}%`;
+            
+            const endpoints = (currentData.endpoints || []).filter(e => e.total_calls > 0);
+            if (endpoints.length > 0) {
+                const avgP95 = (endpoints.reduce((acc, e) => acc + e.p95_duration_ms, 0) / endpoints.length).toFixed(1);
+                const avgSuccess = (endpoints.reduce((acc, e) => acc + (e.success_rate_pct || 0), 0) / endpoints.length).toFixed(1);
+                document.getElementById('val-latency').innerText = `${avgP95}ms`;
+                document.getElementById('val-success').innerText = `${avgSuccess}%`;
+            } else {
+                document.getElementById('val-latency').innerText = "0ms";
+                document.getElementById('val-success').innerText = "100%";
+            }
         }
 
         function renderTable() {
+            if (!currentData) return;
             const tbody = document.getElementById('endpoint-table');
+            const searchTerm = document.getElementById('search-input').value.toLowerCase();
+            const sortBy = document.getElementById('filter-sort').value;
             const statusFilter = document.getElementById('filter-status').value;
             
-            let html = '';
-            const endpoints = currentData.endpoints || [];
-            endpoints.forEach(e => {
-                if (statusFilter !== 'all' && e.status !== statusFilter) return;
+            let endpoints = [...(currentData.endpoints || [])];
 
-                const errorRate = (100 - (e.success_rate_pct || 100)).toFixed(1);
+            if (statusFilter !== 'all') {
+                endpoints = endpoints.filter(e => e.status === statusFilter);
+            }
+
+            endpoints = endpoints.filter(e => 
+                e.path.toLowerCase().includes(searchTerm) || 
+                e.method.toLowerCase().includes(searchTerm)
+            );
+
+            endpoints.sort((a, b) => {
+                if (sortBy === 'calls') return b.total_calls - a.total_calls;
+                if (sortBy === 'p95') return b.p95_duration_ms - a.p95_duration_ms;
+                return a.path.localeCompare(b.path);
+            });
+
+            let html = '';
+            endpoints.forEach(e => {
+                const err4pct = (e.error_4xx_count / e.total_calls * 100) || 0;
+                const err5pct = (e.error_5xx_count / e.total_calls * 100) || 0;
                 
+                // --- ATOMIC SMART DATE LOGIC ---
+                let dateDisplay = "Never";
+                if (e.last_called_at) {
+                    const d = new Date(e.last_called_at * 1000);
+                    const now = new Date();
+                    
+                    // Format time HH:MM
+                    const timeStr = d.getHours().toString().padStart(2, '0') + ':' + 
+                                  d.getMinutes().toString().padStart(2, '0');
+                    
+                    // Check if it's actually the same calendar day (ignoring backend diff)
+                    const isToday = d.toDateString() === now.toDateString();
+
+                    if (isToday) {
+                        dateDisplay = `Today ${timeStr}`;
+                    } else {
+                        const dateStr = d.toISOString().split('T')[0];
+                        dateDisplay = `${dateStr} ${timeStr}`;
+                    }
+                }
+
                 html += `
                     <tr>
                         <td>
-                            <div><span class="method">${e.method}</span><span class="path">${e.path}</span></div>
-                            <div class="error-rate-bar"><div class="error-rate-fill" style="width: ${errorRate}%"></div></div>
+                            <span class="method">${e.method}</span><span class="path">${e.path}</span>
+                            <div class="error-breakdown" title="Errors: ${e.error_4xx_count} 4xx / ${e.error_5xx_count} 5xx">
+                                <div class="err-4xx" style="width: ${err4pct}%"></div>
+                                <div class="err-5xx" style="width: ${err5pct}%"></div>
+                            </div>
                         </td>
-                        <td><span class="badge badge-${e.status}">${e.status}</span></td>
-                        <td>${e.total_calls.toLocaleString()}</td>
-                        <td class="latency">
-                            <span style="color: var(--text-dim)">${e.p50_duration_ms}</span> / 
-                            <span style="font-weight: 600">${e.p95_duration_ms}</span> / 
-                            <span style="color: var(--danger)">${e.p99_duration_ms}</span> <small>ms</small>
+                        <td><span class="badge badge-${e.status}">${e.status.replace('_', ' ')}</span></td>
+                        <td style="font-weight:600; font-size:1.1rem;">${e.total_calls.toLocaleString()}</td>
+                        <td class="latency-cell">
+                            <b>${e.p50_duration_ms}</b> / <b>${e.p95_duration_ms}</b> / <b class="p99">${e.p99_duration_ms}</b> <small>ms</small>
                         </td>
-                        <td style="color: var(--text-dim)">${e.days_since_last_call === 0 ? 'Recently' : e.days_since_last_call + ' days ago'}</td>
+                        <td style="color:var(--text-dim); font-size:0.85rem">
+                            ${dateDisplay}
+                        </td>
                     </tr>
                 `;
             });
-            tbody.innerHTML = html || '<tr><td colspan="5" align="center">No routes match your filters</td></tr>';
+            tbody.innerHTML = html || '<tr><td colspan="5" style="text-align:center; padding:3rem; color:var(--text-dim);">No endpoints found.</td></tr>';
         }
 
         loadData();
-        setInterval(loadData, 30000); // Auto-refresh 30s
+        setInterval(loadData, 30000);
     </script>
 </body>
 </html>
