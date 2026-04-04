@@ -30,7 +30,7 @@ Visualizing your API health has never been easier. Access a built-in, glassmorph
 - **Error Visualization**: Red/Green health bars indicating error rates.
 - **Status Filtering**: Quickly find "Dead" or "Cold" endpoints to clean up your codebase.
 
-![Dashboard Preview](https://raw.githubusercontent.com/AVR216/fastapi-lens/v0.3.2/static/dashboard.png)
+![Dashboard Preview](https://raw.githubusercontent.com/AVR216/fastapi-lens/v0.3.3/static/dashboard.png)
 
 ---
 
@@ -257,7 +257,7 @@ Contributions are what make the open-source community an amazing place to learn,
 4. Push to the Branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
 
-Follow the steps in the [CONTRIBUTING.md](https://github.com/AVR216/fastapi-lens/v0.3.2/CONTRIBUTING.md) file.
+Follow the steps in the [CONTRIBUTING.md](https://github.com/AVR216/fastapi-lens/v0.3.3/CONTRIBUTING.md) file.
 
 ---
 
