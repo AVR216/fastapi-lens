@@ -40,3 +40,4 @@ class LensConfig:
     max_batch_size: int = 100
     dead_threshold_days: int = 30
     cold_threshold_days: int = 7
+    ttl_days: Optional[int] = None

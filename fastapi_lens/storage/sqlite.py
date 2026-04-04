@@ -152,6 +152,27 @@ class SQLiteStorage:
             for row in rows
         ]
 
+    def cleanup_old_data(self, days: int) -> int:
+        """
+        Remove records older than the specified number of days.
+        Returns the number of records deleted.
+        """
+        threshold = time.time() - (days * 86400)
+        conn = self._conn()
+
+        cursor = conn.execute(
+            "DELETE FROM lens_requests WHERE timestamp < ?", (threshold,)
+        )
+        deleted_count = cursor.rowcount or 0
+        conn.commit()
+
+        if deleted_count > 0:
+            conn.execute("VACUUM")
+            conn.commit()
+
+        return deleted_count
+        
+
     def get_percentiles(self, path: str, method: str, since: float = 0.0) -> dict[str, float]:
         """Compute actual p50, p95, p99 for a specific endpoint."""
         conn = self._conn()
