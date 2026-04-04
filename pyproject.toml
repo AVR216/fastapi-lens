@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastapi-lens"
-version = "0.3.3"
+version = "0.3.4"
 description = "API usage intelligence for FastAPI — track, analyze, and surface dead endpoints."
 readme = "README.md"
 license = { text = "MIT" }
